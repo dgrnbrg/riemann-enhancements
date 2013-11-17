@@ -53,6 +53,12 @@
     :db/cardinality :db.cardinality/one
     :db/doc "A metric's partition"
     :db.install/_attribute :db.part/db}
+   ;;TODO: determine if :metric/tick can ever be used effectively?
+   ;;VAET index seems promising, since ticks are partitioned together
+   ;;then membership check requires scanning 1 index for data, the other
+   ;;for membership
+   ;;perhaps partitions should count how many metrics they have, and
+   ;;only pay the membership cost when they've got multiple series
    {:db/id #db/id [:db.part/db]
     :db/ident :metric/tick
     :db/valueType :db.type/ref
@@ -94,6 +100,7 @@
                                                               (hash)
                                                               (Math/abs)
                                                               (Integer/toString 36)))
+                               ;TODO: check that the partition exists, and throw an exception if it does?
                                partition-id (d/tempid :db.part/db)]
                            (concat
                              (when-not host
@@ -195,7 +202,7 @@
              flush? false]
         (if flush?
           (do
-            ;; Could fail
+            ;; TODO: Could fail
             (try (deref (d/transact-async conn pending))
                  (catch Exception e
                    (.printStackTrace e)
@@ -222,7 +229,7 @@
             timeout ([_]
                      (recur pending (async/timeout 10000) (boolean (seq pending))))))))
     (fn [e]
-      ;;Could throw
+      ;;TODO: Could throw
       (async/put! log-chan e))))
 
 (comment
@@ -499,6 +506,16 @@
      (clojure.pprint/pprint)
      )
 
+(defn surround-interval-with-nil-values
+  "Takes a start and end date and a sequence of samples
+   destined for graphite, and surrounds them with nil samples."
+  [^Date start ^Date end samples]
+  (let [s (-> start .getTime (quot 1000))
+        e (-> end .getTime (quot 1000))]
+    (concat [[nil s]]
+            samples
+            [[nil e]])))
+
 (defn handler
   [conn]
   (GET "/render" [target from until format jsonp maxDataPoints]
@@ -538,8 +555,8 @@
                                                                      (quot timestamp 1000)])))
                                                            (remove (fn [[v t]]
                                                                      (= ::remove v)))
-                                                           ;;TODO: put a nil value at the end time, too!
-                                                           (cons [nil (quot (.getTime start) 1000)]))
+                                                           (surround-interval-with-nil-values
+                                                             start end))
                                           ;:datapoints med-data
                                           }
                                          #_{:target (str target "-95")
