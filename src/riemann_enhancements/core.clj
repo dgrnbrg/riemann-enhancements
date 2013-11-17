@@ -48,6 +48,12 @@
     :db/doc "The host of a metric"
     :db.install/_attribute :db.part/db}
    {:db/id #db/id [:db.part/db]
+    :db/ident :metric/partition
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/doc "A metric's partition"
+    :db.install/_attribute :db.part/db}
+   {:db/id #db/id [:db.part/db]
     :db/ident :metric/tick
     :db/valueType :db.type/ref
     :db/isComponent true
@@ -68,13 +74,10 @@
     :db/doc "The time of a tick"
     :db.install/_attribute :db.part/db}
    {:db/id #db/id [:db.part/user]
-    :db/ident :metric/insert
+    :db/ident :metric/create
+    :db/doc "Idempotently creates a metric given a host and service name"
     :db/fn #db/fn {:lang "clojure"
-                   :params [db host-name service-name value time]
-                   ;;In the code, *-id is either an entity id or a tempid, whereas
-                   ;;the plain * is either an entity id or nil. Thus, the pattern
-                   ;;is that we check if the entity exists, and if so, conditionally
-                   ;;do some lookup/transaction expansion
+                   :params [db host-name service-name]
                    :code (let [host (:e (first (d/datoms db :avet :host/name host-name)))
                                service (:e (first (d/datoms db :avet :service/name service-name)))
                                host-id (or host (d/tempid :db.part/user))
@@ -86,8 +89,12 @@
                                                      [?m :metric/host ?h]
                                                      [?m :metric/service ?s]]
                                                    db host-id service-id)))
-                               metric-id (or metric (d/tempid :db.part/user))
-                               tick-id (d/tempid :db.part/user)]
+                               partition (keyword "mpart" (-> (str host-name service-name)
+                                                              ;;TODO: use cryptographic hash here
+                                                              (hash)
+                                                              (Math/abs)
+                                                              (Integer/toString 36)))
+                               partition-id (d/tempid :db.part/db)]
                            (concat
                              (when-not host
                                [{:db/id host-id
@@ -95,29 +102,28 @@
                              (when-not service
                                [{:db/id service-id
                                  :service/name service-name}])
-                             (if metric
-                               [{:db/id metric-id
-                                 :metric/tick tick-id}
-                                {:db/id tick-id
-                                 :tick/time (java.util.Date. time)
-                                 :tick/value value}]        
-                               [{:db/id metric-id
+                             (when-not metric
+                               [{:db/id partition-id
+                                 :db/ident partition
+                                 :db.install/_partition :db.part/db}
+                                {:db/id (d/tempid :db.part/user)
                                  :metric/host host-id
-                                 :metric/service service-id
-                                 :metric/tick tick-id}
-                                {:db/id tick-id
-                                 :tick/time (java.util.Date. time)
-                                 :tick/value value}]))
-                           )}}])
+                                 :metric/partition partition-id
+                                 :metric/service service-id}])))}}])
 
   ;(d/create-database "datomic:mem://metrics")
   ;(d/create-database "datomic:free://localhost:4334/metrics")
   ;(def conn (d/connect "datomic:free://localhost:4334/metrics"))
 (comment
+  (d/create-database "datomic:free://localhost:4334/metrics")
   (d/create-database "datomic:mem://metrics")
   (def conn (d/connect "datomic:mem://metrics"))
 
   (deref (d/transact conn event-schema))
+
+  (deref (d/transact conn [{:db/id #db/id [:db.part/db],
+                            :db/ident :communities,
+                            :db.install/_partition :db.part/db}]))
 
   (deref (d/transact conn [[:metric/insert "example.com" "cpu" 1.3 (System/currentTimeMillis)]]))
 
@@ -144,18 +150,17 @@
      (db conn)))
   )
 
-(defn get-or-create
-  "Gets the unique entity for a given AV pair. Returns either
-   the real id+nil, or a tempid+txn to be included with the actual query."
-  [db a v]
-  (let [old-id (ffirst (q '[:find ?e
-                            :in $ ?a ?v
-                            :where [?e ?a ?v]]
-                          db a v))
-        id (or old-id (d/tempid :db.part/user))
-        txn (when-not old-id
-              [[:db/add id a v]])]
-    [id txn]))
+(defn metric-q
+  "Finds a metric id based on the given host and service"
+  [db host service]
+  (ffirst (q '[:find ?m
+               :in $ ?host ?service
+               :where
+               [?h :host/name ?host]
+               [?s :service/name ?service]
+               [?m :metric/host ?h]
+               [?m :metric/service ?s]]
+             db host service)))
 
 (defn get-or-create-metric
   "Takes an event and returns a metric for it. This will create the metric
@@ -165,36 +170,15 @@
   [conn {:keys [host service] :as e}]
   (when (and host service)
     (let [db (db conn)
-          in-db (ffirst (q '[:find ?m
-                             :in $ ?host ?service
-                             :where
-                             [?h :host/name ?host]
-                             [?s :service/name ?service]
-                             [?m :metric/host ?h]
-                             [?m :metric/service ?s]]
-                           db host service))
-          [host-id host-txn] (get-or-create db :host/name host)
-          [service-id service-txn] (get-or-create db :service/name service)
-          tempid (d/tempid :db.part/db)
-          txn (when-not in-db
-                (concat
-                  host-txn
-                  service-txn
-                  [{:db/id tempid
-                    :metric/host host-id
-                    :metric/service service-id
-                    :db.install/_partition :db.part/db}]))
-          resolved-id (when txn
-                        (d/resolve-tempid
-                          db 
-                          (:tempids @(d/transact conn txn))
-                          tempid))]
-      (or in-db resolved-id))))
+          metric (metric-q db host service)
+          {:keys [db-after]} (when-not metric
+                               @(d/transact conn [[:metric/create host service]]))]
+      (or metric (metric-q db-after host service)))))
 
 (comment
   (get-or-create-metric conn {:host "example.com" :service "cpu"})
 
-  (get-or-create-metric conn {:host "example.com" :service "lol"})
+  (get-or-create-metric conn {:host "example.com" :service "lol3"})
   (get-or-create-metric conn {:host "example.com"})
   )
 
@@ -224,8 +208,12 @@
           (async/alt!!
             log-chan ([e]
                       (let [metric-id (get-or-create-metric conn e)
+                            tick-id (-> (d/entity (db conn) metric-id)
+                                        :metric/partition
+                                        d/tempid)
                             tx (when (and metric-id (:metric e))
-                                 {:db/id (d/tempid metric-id)
+                                 {:db/id tick-id
+                                  :metric/_tick metric-id
                                   :tick/time (java.util.Date.)
                                   :tick/value (double (:metric e))})]
                         (recur (if tx
@@ -257,45 +245,40 @@
      (db (d/connect "datomic:mem://metrics"))
      )
 
-  (q '[:find ?time ?value
-       :in $ ?host ?service ?from
+  (dorun (map (fn [[t]]
+         (println (d/ident (db conn) (d/part t)))
+                (println (d/touch (d/entity (db conn) t)))
+         
+         ) (q '[:find ?t
+       :in $ ?host ?service
        :where
        [?h :host/name ?host]
        [?s :service/name ?service]
        [?m :metric/host ?h]
        [?m :metric/service ?s]
        [?m :metric/tick ?t]
-       [?t :tick/value ?value]    
-       [?t :tick/time ?t-raw]
-       [(.getTime ^java.util.Date ?t-raw) ?time]
-       [(> ?time ?from)]]
-     (db conn) "localhost" "memory" (- (System/currentTimeMillis) (* 60 1000 10))) 
+       ]
+     (db conn) "localhost" "cpu")))
   )
 
-(defn metric-q
-  "Finds a metric id based on the given host and service"
-  [db host service]
-  (ffirst (q '[:find ?m
-               :in $ ?host ?service
-               :where
-               [?h :host/name ?host]
-               [?s :service/name ?service]
-               [?m :metric/host ?h]
-               [?m :metric/service ?s]]
-             db host service)))
+;(metric-ts-q (db conn) cpu (java.util.Date. (- (System/currentTimeMillis) (* 1000 60 10))) (java.util.Date.)) 
 
 (defn metric-ts-q
   "Finds the metric timeseries from the given metric between the requested start and end.
    
    This should be fast."
   [db metric start end]
-  (let [start-id (d/entid-at db metric start)
+  (let [metric-partition (->> metric
+                              (d/entity db)
+                              (:metric/partition)
+                              (d/entid db))
+        start-id (d/entid-at db metric-partition start)
         end-ms (.getTime ^Date end)
         s (->> (d/seek-datoms db :eavt start-id)
                (take-while (fn [datom]
                              (-> (:e datom)
                                  (d/part)
-                                 (= metric))))
+                                 (= metric-partition))))
                (partition-by :e)
                ;;Optimization: this filter can drop at most 1 value from the start and end
                (filter (fn [values]
