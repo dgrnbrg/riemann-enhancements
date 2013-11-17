@@ -164,9 +164,7 @@
 
 (defn get-or-create-metric
   "Takes an event and returns a metric for it. This will create the metric
-   in Datomic if it doesn't already exist there.
-   
-   TODO: make this atomic/idempotent"
+   in Datomic if it doesn't already exist there."
   [conn {:keys [host service] :as e}]
   (when (and host service)
     (let [db (db conn)
@@ -369,15 +367,6 @@
                :value 0.0})
             (range last-gaps)))))
 
-(defn zero-gaps
-  "Takes a sequence of samples and start and end times, and returns a
-   sequence that includes all the given data, plus zero-valued samples
-   just before or just after values that had a gap that was 'significant'
-   according to the given parameter"
-  [start end significant-gap samples]
-  ;;TODO: implement
-  )
-
 (defn metric-quantile
   "Takes a sequence of values and finds the given exact quantile"
   [quantile values]
@@ -549,6 +538,7 @@
                                                                      (quot timestamp 1000)])))
                                                            (remove (fn [[v t]]
                                                                      (= ::remove v)))
+                                                           ;;TODO: put a nil value at the end time, too!
                                                            (cons [nil (quot (.getTime start) 1000)]))
                                           ;:datapoints med-data
                                           }
