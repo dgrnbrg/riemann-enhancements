@@ -217,6 +217,8 @@
   )
 
 (defn log-to-datomic
+  "Takes the uri of the datomic db that will be used to store the metrics. This should be the only
+   thing going into that db (remember that transactors have an unlimited number of dbs)."
   [uri]
   (d/create-database uri)
   (let [conn (d/connect uri)
