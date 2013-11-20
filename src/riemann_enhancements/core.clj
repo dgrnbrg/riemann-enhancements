@@ -19,114 +19,143 @@
 ;;opportunity to use partitions on host/service pairs
 ;;could use noHistory instead of excision for GC?
 (def event-schema
-  [{:db/id #db/id [:db.part/db]
-    :db/ident :service/name
-    :db/valueType :db.type/string
-    :db/index true
-    :db/cardinality :db.cardinality/one
-    :db/unique :db.unique/identity
-    :db/doc "A service name"
-    :db.install/_attribute :db.part/db}
-   {:db/id #db/id [:db.part/db]
-    :db/ident :host/name
-    :db/valueType :db.type/string
-    :db/index true
-    :db/unique :db.unique/identity
-    :db/cardinality :db.cardinality/one
-    :db/doc "A host name"
-    :db.install/_attribute :db.part/db}
-   {:db/id #db/id [:db.part/db]
-    :db/ident :metric/service
-    :db/valueType :db.type/ref
-    :db/cardinality :db.cardinality/one
-    :db/doc "The service of a metric"
-    :db.install/_attribute :db.part/db}
-   {:db/id #db/id [:db.part/db]
-    :db/ident :metric/host
-    :db/valueType :db.type/ref
-    :db/cardinality :db.cardinality/one
-    :db/doc "The host of a metric"
-    :db.install/_attribute :db.part/db}
-   {:db/id #db/id [:db.part/db]
-    :db/ident :metric/partition
-    :db/valueType :db.type/ref
-    :db/cardinality :db.cardinality/one
-    :db/doc "A metric's partition"
-    :db.install/_attribute :db.part/db}
-   ;;TODO: determine if :metric/tick can ever be used effectively?
-   ;;VAET index seems promising, since ticks are partitioned together
-   ;;then membership check requires scanning 1 index for data, the other
-   ;;for membership
-   ;;perhaps partitions should count how many metrics they have, and
-   ;;only pay the membership cost when they've got multiple series
-   {:db/id #db/id [:db.part/db]
-    :db/ident :metric/tick
-    :db/valueType :db.type/ref
-    :db/isComponent true
-    :db/cardinality :db.cardinality/many
-    :db/doc "A single metric event"
-    :db.install/_attribute :db.part/db}
-   {:db/id #db/id [:db.part/db]
-    :db/ident :tick/value
-    :db/valueType :db.type/double
-    :db/cardinality :db.cardinality/one
-    :db/doc "The value of a tick"
-    :db.install/_attribute :db.part/db}
-   {:db/id #db/id [:db.part/db]
-    :db/ident :tick/time
-    :db/index true
-    :db/valueType :db.type/instant
-    :db/cardinality :db.cardinality/one
-    :db/doc "The time of a tick"
-    :db.install/_attribute :db.part/db}
-   {:db/id #db/id [:db.part/user]
-    :db/ident :metric/create
-    :db/doc "Idempotently creates a metric given a host and service name"
-    :db/fn #db/fn {:lang "clojure"
-                   :params [db host-name service-name]
-                   :code (let [host (:e (first (d/datoms db :avet :host/name host-name)))
-                               service (:e (first (d/datoms db :avet :service/name service-name)))
-                               host-id (or host (d/tempid :db.part/user))
-                               service-id (or service (d/tempid :db.part/user))
-                               metric (when (and host service)
-                                        (ffirst (q '[:find ?m
-                                                     :in $ ?h ?s
-                                                     :where
-                                                     [?m :metric/host ?h]
-                                                     [?m :metric/service ?s]]
-                                                   db host-id service-id)))
-                               partition (keyword "mpart" (-> (str host-name service-name)
-                                                              ;;TODO: use cryptographic hash here
-                                                              (hash)
-                                                              (Math/abs)
-                                                              (Integer/toString 36)))
-                               ;TODO: check that the partition exists, and throw an exception if it does?
-                               partition-id (d/tempid :db.part/db)]
-                           (concat
-                             (when-not host
-                               [{:db/id host-id
-                                 :host/name host-name}])
-                             (when-not service
-                               [{:db/id service-id
-                                 :service/name service-name}])
-                             (when-not metric
-                               [{:db/id partition-id
-                                 :db/ident partition
-                                 :db.install/_partition :db.part/db}
-                                {:db/id (d/tempid :db.part/user)
-                                 :metric/host host-id
-                                 :metric/partition partition-id
-                                 :metric/service service-id}])))}}])
+  [[{:db/id #db/id [:db.part/db]
+     :db/ident :service/name
+     :db/valueType :db.type/string
+     :db/index true
+     :db/cardinality :db.cardinality/one
+     :db/unique :db.unique/identity
+     :db/doc "A service name"
+     :db.install/_attribute :db.part/db}
+    {:db/id #db/id [:db.part/db]
+     :db/ident :host/name
+     :db/valueType :db.type/string
+     :db/index true
+     :db/unique :db.unique/identity
+     :db/cardinality :db.cardinality/one
+     :db/doc "A host name"
+     :db.install/_attribute :db.part/db}
+    {:db/id #db/id [:db.part/db]
+     :db/ident :metric/service
+     :db/valueType :db.type/ref
+     :db/cardinality :db.cardinality/one
+     :db/doc "The service of a metric"
+     :db.install/_attribute :db.part/db}
+    {:db/id #db/id [:db.part/db]
+     :db/ident :metric/host
+     :db/valueType :db.type/ref
+     :db/cardinality :db.cardinality/one
+     :db/doc "The host of a metric"
+     :db.install/_attribute :db.part/db}
+    {:db/id #db/id [:db.part/db]
+     :db/ident :metric/partition
+     :db/valueType :db.type/ref
+     :db/cardinality :db.cardinality/one
+     :db/doc "A metric's partition"
+     :db.install/_attribute :db.part/db}
+    ;;TODO: determine if :metric/tick can ever be used effectively?
+    ;;VAET index seems promising, since ticks are partitioned together
+    ;;then membership check requires scanning 1 index for data, the other
+    ;;for membership
+    ;;perhaps partitions should count how many metrics they have, and
+    ;;only pay the membership cost when they've got multiple series
+    {:db/id #db/id [:db.part/db]
+     :db/ident :metric/tick
+     :db/valueType :db.type/ref
+     :db/isComponent true
+     :db/cardinality :db.cardinality/many
+     :db/doc "A single metric event"
+     :db.install/_attribute :db.part/db}
+    {:db/id #db/id [:db.part/db]
+     :db/ident :tick/value
+     :db/valueType :db.type/double
+     :db/cardinality :db.cardinality/one
+     :db/doc "The value of a tick"
+     :db.install/_attribute :db.part/db}
+    {:db/id #db/id [:db.part/db]
+     :db/ident :tick/time
+     :db/index true
+     :db/valueType :db.type/instant
+     :db/cardinality :db.cardinality/one
+     :db/doc "The time of a tick"
+     :db.install/_attribute :db.part/db}
+    {:db/id #db/id [:db.part/db]
+     :db/ident :metrics/count
+     :db/valueType :db.type/long
+     :db/cardinality :db.cardinality/one
+     :db/doc "A count of the number of metrics"
+     :db.install/_attribute :db.part/db}
+    {:db/id #db/id [:db.part/user]
+     :db/ident :metrics/initialize
+     :db/doc "Initializes metrics system"
+     :db/fn #db/fn {:lang "clojure"
+                    :params [db]
+                    :code (let [metrics-total (d/entid db :metrics/total)]
+                            (when-not metrics-total
+                              [{:db/id (d/tempid :db.part/user)
+                                :db/ident :metrics/total
+                                :db/doc "The total number of metrics in this database"
+                                :metrics/count 0}]))}}]
+   [[:metrics/initialize]
+    {:db/id #db/id [:db.part/user]
+     :db/ident :metric/create
+     :db/doc "Idempotently creates a metric given a host and service name"
+     :db/fn #db/fn {:lang "clojure"
+                    :params [db host-name service-name]
+                    :code (let [host (:e (first (d/datoms db :avet :host/name host-name)))
+                                service (:e (first (d/datoms db :avet :service/name service-name)))
+                                host-id (or host (d/tempid :db.part/user))
+                                service-id (or service (d/tempid :db.part/user))
+                                metric (when (and host service)
+                                         (ffirst (q '[:find ?m
+                                                      :in $ ?h ?s
+                                                      :where
+                                                      [?m :metric/host ?h]
+                                                      [?m :metric/service ?s]]
+                                                    db host-id service-id)))
+                                total-metrics-datom (first (d/datoms db :eavt (d/entid db :metrics/total) :metrics/count))
+                                total-metrics (:v total-metrics-datom)
+                                partition (keyword "mpart" (-> (inc total-metrics)
+                                                               (Integer/toString 36)))
+                                partition-id (d/tempid :db.part/db)]
+                            (when (zero? (:e total-metrics-datom)) ;;datomic query "nil" 
+                              (throw (ex-info ":metrics/total doesn't exist!" total-metrics-datom)))
+                            (concat
+                              (when-not host
+                                [{:db/id host-id
+                                  :host/name host-name}])
+                              (when-not service
+                                [{:db/id service-id
+                                  :service/name service-name}])
+                              (when-not metric
+                                [{:db/id (:e total-metrics-datom)
+                                  :metrics/count (inc total-metrics)}
+                                 {:db/id partition-id
+                                  :db/ident partition
+                                  :db.install/_partition :db.part/db}
+                                 {:db/id (d/tempid :db.part/user)
+                                  :metric/host host-id
+                                  :metric/partition partition-id
+                                  :metric/service service-id}])))}}]])
 
   ;(d/create-database "datomic:mem://metrics")
   ;(d/create-database "datomic:free://localhost:4334/metrics")
   ;(def conn (d/connect "datomic:free://localhost:4334/metrics"))
 (comment
+  (q '[:find ?t
+       :where [:metrics/total :metrics/count ?t]]
+     (db conn))
+  (:metric/partition (d/entity (db conn) (get-or-create-metric conn {:host "test1" :service "foo"})))
+  (:metric/partition (d/entity (db conn) (get-or-create-metric conn {:host "test1" :service "fo1o"})))
+  (:metric/partition (d/entity (db conn) (get-or-create-metric conn {:host "test2" :service "fo1o"})))
+
+
   (d/create-database "datomic:free://localhost:4334/metrics")
   (d/create-database "datomic:mem://metrics")
   (def conn (d/connect "datomic:mem://metrics"))
 
-  (deref (d/transact conn event-schema))
+  (deref (d/transact conn (first event-schema)))
+  (deref (d/transact conn (second event-schema)))
 
   (deref (d/transact conn [{:db/id #db/id [:db.part/db],
                             :db/ident :communities,
