@@ -18,6 +18,10 @@ Implement enough of Graphite's API to support (graphitus)[https://github.com/ere
 
 Clean up all the println/comments.
 
+The current version only can handle up to a million metrics due to Datomic design decisions. By implementing DB sharding, we could scale to many million of metrics and improve write parallelism. This *does not* affect the number of metrics storable.
+
+There's no way to purge old data.
+
 ## Design
 
 The Datomic indices are structured so that a given metric is indexed by its host and service, and that finding all services on a host or all hosts running a service is efficient. Once a metric has been chosen, queries are able to seek directly to the starting time of the requested data and read `[time, value]` pairs by linearly scanning the raw index, until the ending time of the data is reached.
