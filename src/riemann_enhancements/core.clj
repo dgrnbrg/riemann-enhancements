@@ -330,214 +330,23 @@
     s))
 
 (defn or-fn
+  "like `or`, but a function instead of a macro"
   [& args]
   (reduce #(or %1 %2) false args))
 
 (def presence
+  "Narrator aggregator that returns truthy if any of the values
+   it is combining are truthy"
   (narrator.core/monoid-aggregator
     :initial (constantly false)
     :pre-process (constantly true)
     :combine or-fn))
 
-(comment (def cpu (metric-q (db conn) "localhost" "cpu"))
-         (query-seq
-           [:tick/value {:quantile [(n/quantiles {:quantiles [0.5]}) #(get % 0.5)]
-                         :presence? [(n/moving 30000 presence) presence]}]
-           {:timestamp (fn [{t :tick/time}] (.getTime ^Date t))
-            :period 3370}
-           (metric-ts-q (db conn) cpu (java.util.Date. (- (System/currentTimeMillis) (* 1000 60 10))) (java.util.Date.)))
-              
-         (query-seq
-           [:tick/value {:quantile [(n/quantiles {:quantiles [0.5]}) #(get % 0.5)]
-                         :presence? [(n/moving 30000 presence) first]}]
-           {:timestamp (fn [{t :tick/time}] (.getTime ^Date t))
-            :period 485393}
-           (metric-ts-q (db conn) cpu (java.util.Date. (- (System/currentTimeMillis) (* 1000 60 60 24 5))) (java.util.Date.)))
-               
-         (count (metric-ts-q (db conn) cpu (java.util.Date. (- (System/currentTimeMillis) (* 1000 60 60 24 5))) (java.util.Date.))))
-
-;;TODO: this gives strang looking results when upsampling instead of downsampling
-(defn intervalize-by
-  "Takes a series of ticks and intervalizes them into groups of the requested size.
-   Should not have weird aliasing artifacts, as every interval will be aligned regardless
-   of the supplied ticks."
-  [interval-ms ticks]
-  (let [->interval (fn [tick] (quot (.getTime ^Date (:tick/time tick)) interval-ms))]
-    (loop [current-interval  (->interval (first ticks))
-           current-vals [(:tick/value (first ticks))]
-           ticks (next ticks)
-           past []]
-      (if (seq ticks)
-        (if (= (->interval (first ticks)) current-interval)
-          (recur current-interval (conj current-vals (-> ticks first :tick/value))
-                 (next ticks) past)
-          ;;subtract one because we want to find adjacent intervals
-          (let [gaps (- (->interval (first ticks)) current-interval 1)] 
-            (when (pos? gaps) (println "got gaps:" gaps))
-            (recur (->interval (first ticks))
-                   [(:tick/value (first ticks))]
-                   (next ticks)
-                   (apply conj past {:time (* interval-ms current-interval) :values current-vals}
-                          (mapv (fn [i] {:time (* interval-ms (+ current-interval i 1))
-                                        :values []}) (range gaps))))))
-        (conj past {:time (* interval-ms current-interval) :values current-vals})))))
-
-(defn pad-intervals
-  "Takes a sequence of intervals and a start time, and pads out the sequence
-   of intervals from the start time"
-  [start end interval-ms intervals]
-  (let [desired-last (quot end interval-ms)
-        empirical-last (quot (:timestamp (last intervals)) interval-ms)
-        ;;Always have 1 fewer last gaps because we'd rather not have any data
-        ;;if we haven't collected any samples from the most recent interval,
-        ;;since a 0 vaue there would be misleading
-        last-gaps (- desired-last empirical-last 1)
-        desired-first (quot start interval-ms)
-        empirical-first (quot (:timestamp (first intervals)) interval-ms)
-        first-gaps (- empirical-first desired-first)]
-    (println "padding" first-gaps last-gaps)
-    (concat
-      (mapv (fn [i]
-              {:timestamp (* interval-ms (+ desired-first i))
-               :value 0.0})
-            (range first-gaps))
-      intervals
-      (mapv (fn [i]
-              {:timestamp (* interval-ms (+ empirical-last i))
-               :value 0.0})
-            (range last-gaps)))))
-
-(defn metric-quantile
-  "Takes a sequence of values and finds the given exact quantile"
-  [quantile values]
-  (let [sorted (sort values)
-        size (count values)
-        index (long (* quantile size))]
-    (if (seq values) 
-      (nth sorted index)
-      0.0)))
-
 (defn parse-minutes->millitime
+  "Used in giraffe's requests"
   [time-str]
-  (let [[_ min] (re-matches #"-(\d+)minutes" time-str)]
+  (let [[_ min] (re-matches #"^-(\d+)minutes$" time-str)]
     (* (Long. min) 60 1000)))
-
-(defn interpolator 
- "Takes a coll of 2D points and returns 
-  their linear interpolation function."
- [points]
-  (let [m (into (sorted-map) points)]
-    (fn [x]
-      (let [[[x1 y1]] (rsubseq m <= x)
-            [[x2 y2]] (subseq m > x)]
-        (cond
-          (not x2) 0
-          (not x1) 0
-          :else (+ y1 (* (- x x1) (/ (- y2 y1) (- x2 x1)))))))))
-
-(defn ema
-  [decay [[x y] & pts]]
-  (loop [[[x y] & pts] pts
-         x* x
-         y* y]
-    (let [decay' (Math/pow (- 1 decay) (- x x*))]
-      (if (and x y)
-        (recur pts
-               x 
-               (+ (* decay' y*)
-                  (* (- 1 decay') y)))
-        y*))))
-
-(defn region-averager
-  "Returns the average of the points w/in +-r
-   of the target."
- [r points]
-  (let [m (into (sorted-map) points)]
-    (fn [x]
-      (let [pts  (subseq m > (- x r) <= (+ x r))]
-        (if (seq pts)
-          (/ (apply + (mapv second pts))
-             (count pts))
-          0)))))
-
-(defn region-median
-  "Returns the average of the points w/in +-r
-   of the target."
-  [r points]
-  (let [m (into (sorted-map) points)]
-    (fn [x]
-      (let [pts (subseq m > (- x r) <= (+ x r))]
-        (if (seq pts)
-          (second (nth pts (quot (count pts) 2)))
-          0)))))
-
-(defn poisson-window
-  "From http://en.wikipedia.org/wiki/Window_function#Exponential_or_Poisson_window"
-  [N t n]
-  (let [c (double (/ (dec N) 2))]
-    (Math/exp (- (/ (Math/abs (- n c)) t)))))
-
-(defn poisson-average
-  [samples min-x max-x]
-  (let [N 1.0
-        x-range (- max-x min-x)
-        ;;60 DB attenuation after half distance
-        t (/ (* N 8.69) (* 2 60))
-        values
-        (for [[x y] samples
-              :let [x-offset (/ (- x min-x) x-range)
-                    weight (poisson-window N t x-offset)]]
-              [weight (* weight y)])
-        total-weight (apply + (mapv first values))
-        total-value (apply + (mapv second values))]
-    (/ total-value total-weight)))
-
-(defn region-poisson-averager
-  "Returns the average of the points w/in +-r
-   of the target."
-  [r points]
-  (let [m (into (sorted-map) points)]
-    (fn [x]
-      (let [pts  (subseq m > (- x r) <= (+ x r))]
-        (if (seq pts)
-          (poisson-average pts (- x r) (+ x r))
-          0)))))
-
-(defn averager
-  "Takes a coll of 2D points and returns a function that
-   returns their average over the given interval"
-  [points]
-  (let [m (into (sorted-map) points)]
-    (fn [x-min x-max]
-      (let [xs (filter (fn [[x y]]
-                         (and (>= x x-min)
-                              (<= x x-max)))
-                       m)]
-        (if (seq xs)
-          (/ (apply + (mapv second xs))
-             (count xs))
-          0)))))
-
-(defn compute-data-with-fn
-  [raw f earliest maxDataPoints]
-  (let [data-fn (->> raw
-                     (sort-by first)
-                     f)
-        data (map (fn [t]
-                    [(data-fn t) (quot t 1000)])
-                  (range earliest (System/currentTimeMillis)
-                         (/ (- (System/currentTimeMillis)
-                               earliest)
-                            (Long. maxDataPoints))))]
-    data))
-
-#_(->> (metric-ts-q (db conn) (metric-q (db conn) "localhost" "cpu")
-                   (Date. (- (System/currentTimeMillis) (* 1000 60 10)))
-                   (Date.))
-     (intervalize-by 30000)
-     (map (partial metric-quantile 0.5))
-     (clojure.pprint/pprint)
-     )
 
 (defn surround-interval-with-nil-values
   "Takes a start and end date and a sequence of samples
@@ -554,11 +363,11 @@
    them to the target `ms-per-interval`, if needed. Emits
    a nil-valued point in intervals for which the `meaningful-gap`
    has elapsed without seeing any samples"
-  [ticks ms-per-interval meaningful-gap]
+  [quantile ticks ms-per-interval meaningful-gap]
   (->> (query-seq
          [:tick/value
-          {:quantile [(n/quantiles {:quantiles [0.5]})
-                      #(get % 0.5)]
+          {:quantile [(n/quantiles {:quantiles [quantile]})
+                      #(get % quantile)]
            :presence? (n/moving (max meaningful-gap  ms-per-interval)
                                 presence)}]
          {:timestamp (fn [{t :tick/time}] (.getTime ^Date t))
@@ -585,43 +394,29 @@
              end (Date.)
              ticks (metric-ts-q db metric start end)
              ms-per-interval (max (quot delta (quot (Long. maxDataPoints) 2)) 0)
-             ;;med-data (->> ticks
-             ;;              (intervalize-by ms-per-interval)
-             ;;              (pad-intervals (.getTime start) (.getTime end) ms-per-interval)
-             ;;              (map (fn [{:keys [time values]}]
-             ;;                     [
-             ;;                      (metric-quantile 0.5 values)
-             ;;                      (quot time 1000)
-             ;;                      ])))
              json (json/generate-string [
                                          {:target (str target "-50")
                                           :datapoints (->> (if (seq ticks)
                                                              (downsample-and-preserve-meaningful-gaps
-                                                               ticks ms-per-interval 30000)
+                                                               0.5 ticks ms-per-interval 30000)
                                                              [])
                                                            (surround-interval-with-nil-values
-                                                             start end))
-                                          ;:datapoints med-data
-                                          }
-                                         #_{:target (str target "-95")
-                                          :datapoints (->> ticks
-                                                           (intervalize-by ms-per-interval)
-                                                           (pad-intervals (.getTime start) (.getTime end) ms-per-interval)
-                                                           (map (fn [{:keys [time values]}]
-                                                                  [
-                                                                   (metric-quantile 0.95 values)
-                                                                   (quot time 1000)
-                                                                   ])))}
+                                                             start end))}
+                                         #_{:target (str target "-75")
+                                          :datapoints (->> (if (seq ticks)
+                                                             (downsample-and-preserve-meaningful-gaps
+                                                               0.75 ticks ms-per-interval 30000)
+                                                             [])
+                                                           (surround-interval-with-nil-values
+                                                             start end))}
                                          #_{:target (str target "-99")
-                                          :datapoints (->> ticks
-                                                           (intervalize-by ms-per-interval)
-                                                           (pad-intervals (.getTime start) (.getTime end) ms-per-interval)
-                                                           (map (fn [{:keys [time values]}]
-                                                                  [
-                                                                   (metric-quantile 0.99 values)
-                                                                   (quot time 1000)
-                                                                   ])))}])]
-         ;(println json)
+                                          :datapoints (->> (if (seq ticks)
+                                                             (downsample-and-preserve-meaningful-gaps
+                                                               0.99 ticks ms-per-interval 30000)
+                                                             [])
+                                                           (surround-interval-with-nil-values
+                                                             start end))}
+                                         ])]
          #_(when (seq ticks)
            (println "Downsample ratio:" (double (/ (count med-data) (count ticks)))
                     "total:" (count med-data)))
@@ -635,12 +430,6 @@
         (wrap-resource "giraffe")
         (wrap-json-response)
         (wrap-params)
-        ((fn [h]
-          (fn [r]
-            (let [x (h r)]
-              ;(println "headers:" (:headers x))
-              ;(pr "got response" (:body x))
-              x))))
         (wrap-reload)
         (wrap-stacktrace)
         )))
