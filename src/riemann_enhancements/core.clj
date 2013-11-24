@@ -2,15 +2,16 @@
   (:import java.util.Date)
   (:require [clojure.core.async :as async]
             [narrator.query :refer (query-seq)]
+            [clojure.tools.logging :as log]
+            [riemann.service :refer (Service ServiceEquiv)]
             [narrator.operators :as n]
-            [ring.adapter.jetty :refer (run-jetty)]
+            [aleph.http :as aleph]
             [ring.middleware.json :refer (wrap-json-response)]
             [clojure.core.reducers :as r]
             [cheshire.core :as json]
             [ring.middleware.params :refer (wrap-params)]
             [ring.middleware.stacktrace :refer (wrap-stacktrace)]
-            [ring.middleware.reload :refer (wrap-reload)]
-            [ring.util.response :refer (response content-type)]
+            [ring.util.response :refer (response content-type status)]
             [ring.middleware.resource :refer (wrap-resource)]
             [clojure.string :as str]
             [compojure.core :refer (GET routes)]
@@ -384,62 +385,102 @@
                  (= ::remove v)))))
 
 (defn graphite-api
-  [conn]
-  (GET "/render" [target from until format maxDataPoints jsonp]
-       (let [db (db conn)
-             [host service] (str/split target #":" 2)
-             delta (parse-minutes->millitime from)
-             metric (metric-q db host service)
-             start (Date. (- (System/currentTimeMillis) delta))
-             end (Date.)
-             ticks (metric-ts-q db metric start end)
-             ms-per-interval (max (quot delta (quot (Long. maxDataPoints) 2)) 0)
-             json (json/generate-string [
-                                         {:target (str target "-50")
-                                          :datapoints (->> (if (seq ticks)
-                                                             (downsample-and-preserve-meaningful-gaps
-                                                               0.5 ticks ms-per-interval 30000)
-                                                             [])
-                                                           (surround-interval-with-nil-values
-                                                             start end))}
-                                         #_{:target (str target "-75")
-                                          :datapoints (->> (if (seq ticks)
-                                                             (downsample-and-preserve-meaningful-gaps
-                                                               0.75 ticks ms-per-interval 30000)
-                                                             [])
-                                                           (surround-interval-with-nil-values
-                                                             start end))}
-                                         #_{:target (str target "-99")
-                                          :datapoints (->> (if (seq ticks)
-                                                             (downsample-and-preserve-meaningful-gaps
-                                                               0.99 ticks ms-per-interval 30000)
-                                                             [])
-                                                           (surround-interval-with-nil-values
-                                                             start end))}
-                                         ])]
-         #_(when (seq ticks)
-           (println "Downsample ratio:" (double (/ (count med-data) (count ticks)))
-                    "total:" (count med-data)))
-         (assert (= format "json"))
-         (-> (response (str jsonp "(" json ")"))
-             (content-type "application/json")))))
-
-(def myapp
-  (let [conn (d/connect "datomic:free://localhost:4334/metrics")]
-    (-> (graphite-api conn)
+  [uri]
+  ;; By creating here, we prevent a race condition on whether this server runs first, or the
+  ;; stream sink that logs to datomic
+  (d/create-database uri)
+  (let [conn (d/connect uri)]
+    (-> (GET "/render" [target from until format maxDataPoints jsonp]
+             (let [db (db conn)
+                   [host service] (str/split target #":" 2)
+                   delta (parse-minutes->millitime from)
+                   metric (metric-q db host service)
+                   start (Date. (- (System/currentTimeMillis) delta))
+                   end (Date.)
+                   ticks (metric-ts-q db metric start end)
+                   ms-per-interval (max (quot delta (quot (Long. maxDataPoints) 2)) 0)
+                   json (json/generate-string [
+                                               {:target (str target "-50")
+                                                :datapoints (->> (if (seq ticks)
+                                                                   (downsample-and-preserve-meaningful-gaps
+                                                                     0.5 ticks ms-per-interval 30000)
+                                                                   [])
+                                                                 (surround-interval-with-nil-values
+                                                                   start end))}
+                                               #_{:target (str target "-75")
+                                                  :datapoints (->> (if (seq ticks)
+                                                                     (downsample-and-preserve-meaningful-gaps
+                                                                       0.75 ticks ms-per-interval 30000)
+                                                                     [])
+                                                                   (surround-interval-with-nil-values
+                                                                     start end))}
+                                               #_{:target (str target "-99")
+                                                  :datapoints (->> (if (seq ticks)
+                                                                     (downsample-and-preserve-meaningful-gaps
+                                                                       0.99 ticks ms-per-interval 30000)
+                                                                     [])
+                                                                   (surround-interval-with-nil-values
+                                                                     start end))}
+                                               ])]
+               #_(when (seq ticks)
+                   (println "Downsample ratio:" (double (/ (count med-data) (count ticks)))
+                            "total:" (count med-data)))
+               (assert (= format "json"))
+               (-> (response (str jsonp "(" json ")"))
+                   (status 200)
+                   (content-type "application/json"))))
         (wrap-resource "giraffe")
         (wrap-json-response)
         (wrap-params)
-        (wrap-reload)
-        (wrap-stacktrace)
-        )))
+        (wrap-stacktrace))))
 
-(comment
-  (do
-    (.stop myserver)
-    (def myserver
-      (start-server "datomic:mem://metrics" 8000))))
+(defrecord RingServer [host port handler-name handler core server]
+  ServiceEquiv
+  (equiv? [this other]
+          (and (instance? RingServer other)
+               (= host (:host other))
+               (= port (:port other))  
+               (= handler-name (:handler-name other))))
 
-(defn start-server
-  [uri port]
-  (run-jetty  #'myapp {:port port :join? false}))
+  Service
+  (conflict? [this other]
+             (and (instance? RingServer other)
+                  (= host (:host other))
+                  (= port (:port other))
+                  (= handler-name (:handler-name other))))  
+
+  (reload! [this new-core]
+           (reset! core new-core))
+
+  (start! [this]
+          (locking this
+            (when-not @server
+              (reset! server (aleph/start-http-server
+                               (aleph/wrap-ring-handler handler)
+                               {:host host
+                                :port port}))
+              (log/info "Ring server" host port "online"))))
+
+  (stop! [this]
+         (locking this
+           (when @server
+             (@server)
+             (log/info "Ring server" host port "shut down")))))
+
+(defmacro ring-server
+  "Starts a new websocket server for a core. Starts immediately.
+
+  Options:
+  :host   The address to listen on (default 127.0.0.1)
+          Currently does nothing; this option depends on an incomplete
+          feature in Aleph, the underlying networking library. Aleph will
+          currently bind to all interfaces, regardless of this value.
+  :port   The port to listen on (default 5559)"
+  ([handler & opts]
+   `(->RingServer
+     (get ~opts :host "127.0.0.1")
+     (get ~opts :port 5559)
+     '~handler
+     ~handler
+     (atom nil)
+     (atom nil))))
