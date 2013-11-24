@@ -11,6 +11,7 @@
             [ring.middleware.stacktrace :refer (wrap-stacktrace)]
             [ring.middleware.reload :refer (wrap-reload)]
             [ring.util.response :refer (response content-type)]
+            [ring.middleware.resource :refer (wrap-resource)]
             [clojure.string :as str]
             [compojure.core :refer (GET routes)]
             [datomic.api :as d :refer (q db)]))
@@ -225,7 +226,8 @@
         log-chan (async/chan)
         error-chan (async/chan)]
 
-    (deref (d/transact conn event-schema))
+    (deref (d/transact conn (first event-schema)))
+    (deref (d/transact conn (second event-schema)))
 
     (async/thread
       (loop [pending []
@@ -547,9 +549,34 @@
             samples
             [[nil e]])))
 
-(defn handler
+(defn downsample-and-preserve-meaningful-gaps
+  "Takes a series of ticks from the database and downsamples
+   them to the target `ms-per-interval`, if needed. Emits
+   a nil-valued point in intervals for which the `meaningful-gap`
+   has elapsed without seeing any samples"
+  [ticks ms-per-interval meaningful-gap]
+  (->> (query-seq
+         [:tick/value
+          {:quantile [(n/quantiles {:quantiles [0.5]})
+                      #(get % 0.5)]
+           :presence? (n/moving (max meaningful-gap  ms-per-interval)
+                                presence)}]
+         {:timestamp (fn [{t :tick/time}] (.getTime ^Date t))
+          :period ms-per-interval}
+         ticks)
+       (map (fn [{:keys [timestamp value]}]
+              (let [{p :presence? q :quantile} value]
+                [(cond
+                   q q
+                   (apply or-fn p) ::remove
+                   :else nil)
+                 (quot timestamp 1000)])))
+       (remove (fn [[v t]]
+                 (= ::remove v)))))
+
+(defn graphite-api
   [conn]
-  (GET "/render" [target from until format jsonp maxDataPoints]
+  (GET "/render" [target from until format maxDataPoints jsonp]
        (let [db (db conn)
              [host service] (str/split target #":" 2)
              delta (parse-minutes->millitime from)
@@ -568,24 +595,10 @@
              ;;                      ])))
              json (json/generate-string [
                                          {:target (str target "-50")
-                                          :datapoints (->> (query-seq
-                                                             [:tick/value
-                                                              {:quantile [(n/quantiles {:quantiles [0.5]})
-                                                                          #(get % 0.5)]
-                                                               :presence? (n/moving (max 30000 ms-per-interval)
-                                                                                    presence)}]
-                                                             {:timestamp (fn [{t :tick/time}] (.getTime ^Date t))
-                                                              :period ms-per-interval}
-                                                             ticks)
-                                                           (map (fn [{:keys [timestamp value]}]
-                                                                  (let [{p :presence? q :quantile} value]
-                                                                    [(cond
-                                                                       q q
-                                                                       (apply or-fn p) ::remove
-                                                                       :else nil)
-                                                                     (quot timestamp 1000)])))
-                                                           (remove (fn [[v t]]
-                                                                     (= ::remove v)))
+                                          :datapoints (->> (if (seq ticks)
+                                                             (downsample-and-preserve-meaningful-gaps
+                                                               ticks ms-per-interval 30000)
+                                                             [])
                                                            (surround-interval-with-nil-values
                                                              start end))
                                           ;:datapoints med-data
@@ -618,7 +631,8 @@
 
 (def myapp
   (let [conn (d/connect "datomic:free://localhost:4334/metrics")]
-    (-> (handler conn)
+    (-> (graphite-api conn)
+        (wrap-resource "giraffe")
         (wrap-json-response)
         (wrap-params)
         ((fn [h]
