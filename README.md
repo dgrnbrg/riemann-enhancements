@@ -6,7 +6,7 @@ Right now, it implements a subset of the Graphite API, enough that (Giraffe)[htt
 
 ## Usage
 
-You should add this as a dependency of Riemann, then use `riemann-enhancements.core/log-to-datomic` to make a Riemann stream sink. Call `riemann-enhancements.core/start-server` to start the REST API. The metric names are `host:service` in the Graphite API.
+You should add this as a dependency of Riemann, then use `riemann-enhancements.core/log-to-datomic` to make a Riemann stream sink. Use `service!` on a `riemann-enhancements.core/ring-server` wrapping the `riemann-enhancement.core/graphite-api`. For details, see `riemann.config`. This integrates the Graphite API into the lifecycle management of Riemann, so that it'll work with hot-reloading. You can define dashboards with Clojure data structures that are automatically JSONified for Giraffe; see `riemann-enhancements.core/temp-dashboard` as an example.
 
 ## TODO
 
@@ -16,9 +16,7 @@ The resampler's settings should be exposed through the Graphite API.
 
 Implement enough of Graphite's API to support (graphitus)[https://github.com/erezmazor/graphitus].
 
-Clean up all the println/comments.
-
-The current version only can handle up to a million metrics due to Datomic design decisions. By implementing DB sharding, we could scale to many million of metrics and improve write parallelism. This *does not* affect the number of metrics storable.
+The current version only can handle up to a million metrics due to Datomic design decisions. By implementing DB sharding, we could scale to many million of metrics and improve write parallelism. This *does not* affect the number of metric events storable.
 
 There's no way to purge old data.
 
