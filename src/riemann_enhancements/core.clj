@@ -3,9 +3,7 @@
   (:require [clojure.core.async :as async]
             [narrator.query :refer (query-seq)]
             [clojure.tools.logging :as log]
-            [riemann.service :refer (Service ServiceEquiv)]
             [narrator.operators :as n]
-            [aleph.http :as aleph]
             [ring.middleware.json :refer (wrap-json-response)]
             [clojure.core.reducers :as r]
             [cheshire.core :as json]
@@ -200,6 +198,30 @@
                [?m :metric/service ?s]]
              db host service)))
 
+(defn transact-with-retries
+  "Synchronously attempts to transact, retrying with the `retry-schedule` sleeps
+   between each attempt. If the retry schedule is exhausted, the error will be logged.
+   
+   This should only be used with idempotent transactions, or transactions that
+   can be duplicated if the write succeeds on the the server but not on the client.
+   
+   TODO: metrics tick lookups need to do deduplication"
+  [conn tx-data retry-schedule]
+  (loop [[timeout & retry-schedule] retry-schedule]
+    (let [{:keys [error] :as result}
+          (try
+            @(d/transact conn tx-data)
+            (catch RuntimeException e
+              {:error e}))]
+      (cond
+          (and error timeout)
+          (do (log/warn error "Retrying transaction for" (hash tx-data))
+              (Thread/sleep timeout)
+              (recur retry-schedule))
+          error
+          (log/error error "Failed transaction for" (hash tx-data))
+          :else result))))
+
 (defn get-or-create-metric
   "Takes an event and returns a metric for it. This will create the metric
    in Datomic if it doesn't already exist there."
@@ -208,7 +230,9 @@
     (let [db (db conn)
           metric (metric-q db host service)
           {:keys [db-after]} (when-not metric
-                               @(d/transact conn [[:metric/create host service]]))]
+                               (transact-with-retries conn
+                                                      [[:metric/create host service]]
+                                                      (repeat 10000)))]
       (or metric (metric-q db-after host service)))))
 
 (comment
@@ -224,7 +248,7 @@
   [uri]
   (d/create-database uri)
   (let [conn (d/connect uri)
-        log-chan (async/chan)
+        log-chan (async/chan (async/dropping-buffer 5000))
         error-chan (async/chan)]
 
     (deref (d/transact conn (first event-schema)))
@@ -237,12 +261,8 @@
         (if flush?
           (do
             ;; TODO: Could fail
-            (try (deref (d/transact-async conn pending))
-                 (catch Exception e
-                   (.printStackTrace e)
-                   (throw e)
-                   )
-                 )
+            (transact-with-retries conn pending (repeat 10 10000))
+            ;;TODO finish here
             (recur [] (async/timeout 10000) false))
           (async/alt!!
             log-chan ([e]
@@ -463,53 +483,3 @@
         (wrap-json-response)
         (wrap-params)
         (wrap-stacktrace))))
-
-(defrecord RingServer [host port handler core server]
-  ServiceEquiv
-  (equiv? [this other]
-          (and (instance? RingServer other)
-               (= host (:host other))
-               (= port (:port other))  
-               (= handler (:handler other))))
-
-  Service
-  (conflict? [this other]
-             (and (instance? RingServer other)
-                  (= host (:host other))
-                  (= port (:port other))
-                  (= handler (:handler other))))  
-
-  (reload! [this new-core]
-           (reset! core new-core))
-
-  (start! [this]
-          (locking this
-            (when-not @server
-              (reset! server (aleph/start-http-server
-                               (aleph/wrap-ring-handler handler)
-                               {:host host
-                                :port port}))
-              (log/info "Ring server" host port "online"))))
-
-  (stop! [this]
-         (locking this
-           (when @server
-             (@server)
-             (log/info "Ring server" host port "shut down")))))
-
-(defn ring-server
-  "Starts a new websocket server for a core. Starts immediately.
-
-  Options:
-  :host   The address to listen on (default 127.0.0.1)
-          Currently does nothing; this option depends on an incomplete
-          feature in Aleph, the underlying networking library. Aleph will
-          currently bind to all interfaces, regardless of this value.
-  :port   The port to listen on (default 5559)"
-  ([handler & opts]
-   (->RingServer
-     (get opts :host "127.0.0.1")
-     (get opts :port 5559)
-     handler
-     (atom nil)
-     (atom nil))))
