@@ -13,6 +13,5 @@
                  [compojure "1.1.6"]
                  [narrator "0.1.0"]
                  [ring/ring-devel "1.2.1"]
-                 [org.clojure/core.async "0.1.242.0-44b1e3-alpha"]
                  [com.datomic/datomic-free "0.8.4260"
                   :exclusions [org.slf4j/log4j-over-slf4j]]])

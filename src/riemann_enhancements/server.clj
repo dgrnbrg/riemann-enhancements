@@ -2,6 +2,7 @@
   (:import java.util.Date)
   (:require [riemann-enhancements.core :refer :all]
             [riemann.service :refer (Service ServiceEquiv)]
+            [clojure.tools.logging :as log]
             [aleph.http :as aleph]))
 
 (defrecord RingServer [host port handler core server]

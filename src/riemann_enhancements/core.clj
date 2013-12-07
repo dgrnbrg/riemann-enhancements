@@ -1,7 +1,6 @@
 (ns riemann-enhancements.core
   (:import java.util.Date)
-  (:require [clojure.core.async :as async]
-            [narrator.query :refer (query-seq)]
+  (:require [narrator.query :refer (query-seq)]
             [clojure.tools.logging :as log]
             [narrator.operators :as n]
             [ring.middleware.json :refer (wrap-json-response)]
@@ -242,52 +241,78 @@
   (get-or-create-metric conn {:host "example.com"})
   )
 
+;;; Metrics agents are agents that contain a map. This map has 2 keys: `:metrics` and
+;;; `:conn`. `:conn` is a datomic connection. `:metrics` is a map whose keys are metric ids,
+;;; and whose values are the metric samples. This allows us to efficiently
+;;; determine if a new metric would cause a conflict and require a flush.
+
+(defn flush-metrics
+  "Send this to a metrics agent to flush its contents"
+  [{:keys [metrics conn]}]
+  (let [samples (vals metrics)]
+    ;(println "Flushing" (count samples))
+    (transact-with-retries conn samples (repeat 10 10000))
+    {:metrics {} :conn conn}))
+
+(defn add-metric
+  "Send this to a metrics agent to incorporate a new sample, possibly
+   triggering a flush."
+  [{:keys [conn metrics] :as metrics-agent-data} e]
+  (let [metric-id (get-or-create-metric conn e)
+        tick-id (-> (d/entity (db conn) metric-id)
+                    :metric/partition
+                    d/tempid)
+        tx (when (and metric-id (:metric e))
+             {:db/id tick-id
+              :metric/_tick metric-id
+              :tick/time (java.util.Date.)
+              :tick/value (double (:metric e))})]
+    ;(println "Adding" tx)
+    (if tx
+      (update-in
+        (if (or (contains? metrics metric-id) (> (count metrics) 500))
+          (do
+            ;(println "Detected conflict:" metric-id)
+            (flush-metrics metrics-agent-data))
+          metrics-agent-data)
+        [:metrics] assoc metric-id tx)
+      metrics-agent-data)))
+
 (defn log-to-datomic
   "Takes the uri of the datomic db that will be used to store the metrics. This should be the only
    thing going into that db (remember that transactors have an unlimited number of dbs)."
-  [uri]
-  (d/create-database uri)
-  (let [conn (d/connect uri)
-        log-chan (async/chan (async/dropping-buffer 5000))
-        error-chan (async/chan)]
-
-    (deref (d/transact conn (first event-schema)))
-    (deref (d/transact conn (second event-schema)))
-
-    (async/thread
-      (loop [pending []
-             timeout (async/timeout 10000)
-             flush? false]
-        (if flush?
-          (do
-            ;; TODO: Could fail
-            (transact-with-retries conn pending (repeat 10 10000))
-            ;;TODO finish here
-            (recur [] (async/timeout 10000) false))
-          (async/alt!!
-            log-chan ([e]
-                      (let [metric-id (get-or-create-metric conn e)
-                            tick-id (-> (d/entity (db conn) metric-id)
-                                        :metric/partition
-                                        d/tempid)
-                            tx (when (and metric-id (:metric e))
-                                 {:db/id tick-id
-                                  :metric/_tick metric-id
-                                  :tick/time (java.util.Date.)
-                                  :tick/value (double (:metric e))})]
-                        (recur (if tx
-                                 (conj pending tx)
-                                 pending)
-                               timeout
-                               (= (count pending) 500))))
-            timeout ([_]
-                     (recur pending (async/timeout 10000) (boolean (seq pending))))))))
+  [& {:keys [uri flush-rate] :or {flush-rate 10000}}]
+  (let [metrics-agent (agent {:metrics {}})]
+    ;; Asynchronously connect to and initialize datomic
+    (send-off metrics-agent
+              (fn [metrics]
+                (log/info "Creating database" uri "..."
+                          (d/create-database uri))
+                (assoc metrics :conn (d/connect uri))))
+    (send-off metrics-agent
+              (fn [metrics]
+                (log/info "Transacting schema (1) into" uri)
+                (deref (d/transact (:conn metrics)
+                                   (first event-schema)))
+                metrics))
+    (send-off metrics-agent
+              (fn [metrics]
+                (log/info "Transacting schema (2) into" uri)
+                (deref (d/transact (:conn metrics)
+                                   (second event-schema)))
+                (-> (fn* []
+                         (while true
+                           (Thread/sleep flush-rate)
+                           (send-off metrics-agent flush-metrics)))
+                    (Thread.)
+                    (.start))
+                (log/info "Initialized" uri "successfully")
+                metrics))
     (fn [e]
-      ;;TODO: Could throw
-      (async/put! log-chan e))))
+      (send-off metrics-agent add-metric e))))
 
 (comment
-  
+
   (q '[:find ?host ?service (count)
        :where
        [?h :host/name ?host]
