@@ -242,6 +242,164 @@
   (get-or-create-metric conn {:host "example.com"})
   )
 
+(def *random-delays* false)
+(defmacro random-delay
+  []
+  (when *random-delays*
+    `(try (Thread/sleep (rand-int 200))
+          (catch Exception e# nil))))
+
+
+(def reads (atom 0))
+(def inputs (atom {}))
+(def continues (atom {}))
+(def enqueues (atom {}))
+(def creates (atom 0))
+(def idles (atom {}))
+
+(defn input-chan-callback-generator
+  [facet-fn facet->worker worker-constructor]
+  (fn input-chan-callback
+    [v c]
+    (when v
+      (swap! reads inc)
+      (let [facet (facet-fn v)
+          worker (get facet->worker facet)]
+    #spy/t (str "input " v " on facet " facet " [" (:state worker :not-exist) "] with queue length " (count (:queue worker)) "\n")
+      (if-let [{:keys [state in-chan ack-chan queue]} (get facet->worker facet)]
+        ;; if the worker already exists
+        (if (= state :idle)
+          ;; if idle, immediately start on new work
+          (do (swap! inputs update-in [facet] (fnil inc 0))
+              (async/go (random-delay)  (async/>! in-chan v))
+            #spy/t (str "starting work " v " onto facet " facet  "\n")
+              (assoc-in facet->worker [facet :state] :busy))
+          ;; otherwise, enqueue work
+          (do
+            #spy/t (str "enqueuing work " v " onto facet " facet "\n")
+            (let [x (update-in facet->worker [facet :queue] conj v)]
+              (swap! enqueues update-in [facet] (fnil inc 0))
+              #spy/t (str "enqueue result onto facet " facet " gave " (seq (get-in x [facet :queue])) "\n")
+              x
+              )))
+        ;; if there's no worker
+        (let [{:keys [in-chan ack-chan]} (worker-constructor facet)]
+          #spy/t (str "creating worker for facet " facet " seeded with " v "\n")
+              (swap! creates inc)
+          (assoc facet->worker facet {:state :busy
+                                      :in-chan in-chan
+                                      :ack-chan ack-chan
+                                      :queue (conj clojure.lang.PersistentQueue/EMPTY v)})))))))
+
+(defn ack-chan-callback-generator
+  [facet {:keys [state in-chan ack-chan queue]} facet->worker worker-constructor]
+  (fn ack-chan-callback
+    [v c]
+    #spy/t  (str "acking " v " on facet " facet " [" state "] with queue length " (count queue) "\n")
+    (case v
+      ;;Worker is ready for another message
+      :ready
+      (if-let [work (peek queue)]
+        (do (async/go
+              (swap! continues update-in [facet] (fnil inc 0))
+              (async/>! in-chan work))
+            #spy/t (str "continuing work " work " onto facet " facet  "\n")
+            (let [x (-> facet->worker
+                (assoc-in [facet :state] :busy)
+                (assoc-in [facet :queue] (pop queue)))]
+              #spy/t (str "dequeuing " (peek queue) " from facet " facet " gave " (seq (get-in x [facet :queue])) "\n")
+              x
+              ))
+        (do
+          (swap! idles update-in [facet] (fnil inc 0))
+          (assoc-in facet->worker [facet :state] :idle)))
+      ;;Worker has shut down
+      :shutdown
+      (if (seq queue)
+        ;;After shutdown began, new work arrived, so start a new one
+        (let [{:keys [in-chan ack-chan]} (worker-constructor facet)]
+          (assoc facet->worker facet {:state :busy
+                                      :in-chan in-chan
+                                      :ack-chan ack-chan
+                                      :queue queue}))
+        ;;Clean up reference to old worker
+        (dissoc facet->worker facet))
+      (throw (ex-info "Unexpected message!" {:msg v :chan c})))))
+
+(defn distributor
+  "Takes an input channel, worker constructor (facet is argument, returns {:msg-chan :ack-chan :handle} map),
+   and worker destructor (handle is argument, no return), and creates workers for each facet as they exist,
+   destroying them when they quiesce."
+  [input facet-fn worker-constructor]
+  (async/go-loop [facet->worker {}]
+                 (let [callbacks
+                       (conj
+                         (mapv (fn [[facet {:keys [ack-chan] :as facet-data}]]
+                                 ;;ack-chan message
+                                 [ack-chan (ack-chan-callback-generator facet facet-data facet->worker worker-constructor)])
+                               facet->worker)
+                         [input (input-chan-callback-generator facet-fn facet->worker worker-constructor)])
+                       callback-index (into {} callbacks)
+                       [val port] (async/alts! (map first callbacks))]
+                   (recur ((get callback-index port) val port)))))
+
+(defn basic-worker
+  "Invokes (f init msg) for each recieved message. init takes on that return value next iteration"
+  [f init]
+  (fn [facet]
+    (let [in-chan (async/chan 1024)
+          shutdown-chan (async/chan 1024)
+          ack-chan (async/chan 1024)]
+      #_(random-delay)
+      (async/go
+        (async/>! ack-chan :ready)
+        (async/go-loop [init init]
+                       (async/alt!
+                         shutdown-chan ([_] #spy/t (async/>! ack-chan :shutdown))
+                         in-chan ([msg]
+                                  (let [init' (f init msg)]
+                                          ;(println msg)
+                                          #_(random-delay)
+                                          (async/>! ack-chan :ready)
+                                          (recur init'))))))
+      {:in-chan in-chan
+       :shutdown-chan shutdown-chan
+       :ack-chan ack-chan})))
+
+(def global-counts (atom {}))
+
+(def global-acks (atom 0))
+
+(def facet-counter (basic-worker (fn [c x] 
+                                   #spy/t (str "x is " x "\n")
+                                   (swap! global-acks inc)
+                                   (swap! global-counts update-in [(mod x 5)] (fnil conj []) x)
+                                   nil)
+                                 0))
+
+(comment
+
+  (require 'spyscope.repl)
+  (spyscope.repl/trace-clear)
+  (spyscope.repl/trace-query)
+
+  (println @global-acks)
+
+  (println @inputs @continues @enqueues @reads @creates @global-acks @idles
+           (into {} (for [[k v] @global-counts] [k (count v)])))
+
+  (let [input (async/chan 10000)]
+    (async/onto-chan input (range 1000))
+    (distributor input #(mod % 5) facet-counter))
+
+(every? identity (for [[_ vals] @global-counts] (= vals (sort vals))))
+
+  (println @global-counts)
+
+  (println (count (mapcat val @global-counts)))
+  (println (count @global-counts))
+  (println (map count @global-counts)))
+
 (defn log-to-datomic
   "Takes the uri of the datomic db that will be used to store the metrics. This should be the only
    thing going into that db (remember that transactors have an unlimited number of dbs)."
