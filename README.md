@@ -1,16 +1,18 @@
 # riemann-enhancements
 
-This will be a plugin to allow Riemann to store its metrics into a database, expose them via the Graphite REST API, and perform interesting analyses.
+This is a plugin to allow Riemann to store its metrics into a database, expose them via the Graphite REST API, and perform interesting analyses.
 
-Right now, it implements a subset of the Graphite API, enough that (Giraffe)[https://github.com/kenhub/giraffe] works. It stores all data in Datomic in a specially designed index, designed for efficient queries and optimal data locality.
+Right now, it implements a subset of the Graphite API, enough that (Giraffe)[https://github.com/kenhub/giraffe] works. It stores all data in Datomic in a specially designed index, designed for efficient queries and optimal data locality. It also includes a Ring server for Riemann, so that it can serve the Giraffe dashboard from the port of your choosing, and configure it in your Riemann configuration files.
+
+To use it, you must run Riemann without the helper process. For instance, you could use
+
+```bash
+java -cp /path/to/lib/riemann.jar:/path/to/riemann-enhancements-0.1.0-SNAPSHOT-standalone.jar clojure.main -m riemann.bin /path/to/riemann.config
+```
 
 ## Usage
 
 You should add this as a dependency of Riemann, then use `riemann-enhancements.core/log-to-datomic` to make a Riemann stream sink. Use `service!` on a `riemann-enhancements.core/ring-server` wrapping the `riemann-enhancement.core/graphite-api`. For details, see `riemann.config`. This integrates the Graphite API into the lifecycle management of Riemann, so that it'll work with hot-reloading. You can define dashboards with Clojure data structures that are automatically JSONified for Giraffe; see `riemann-enhancements.core/temp-dashboard` as an example.
-
-## TODO
-
-The transaction retry logic and error reporting must be implemented before this is useful in a real setting.
 
 The resampler's settings should be exposed through the Graphite API.
 

@@ -13,5 +13,5 @@
                  [compojure "1.1.6"]
                  [narrator "0.1.0"]
                  [ring/ring-devel "1.2.1"]
-                 [com.datomic/datomic-free "0.8.4260"
+                 [com.datomic/datomic-free "0.9.4331"
                   :exclusions [org.slf4j/log4j-over-slf4j]]])
