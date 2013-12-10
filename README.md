@@ -2,7 +2,7 @@
 
 This is a plugin to allow Riemann to store its metrics into a database, expose them via the Graphite REST API, and perform interesting analyses.
 
-Right now, it implements a subset of the Graphite API, enough that (Giraffe)[https://github.com/kenhub/giraffe] works. It stores all data in Datomic in a specially designed index, designed for efficient queries and optimal data locality. It also includes a Ring server for Riemann, so that it can serve the Giraffe dashboard from the port of your choosing, and configure it in your Riemann configuration files.
+Right now, it implements a subset of the Graphite API, enough that [Giraffe](https://github.com/kenhub/giraffe) works. It stores all data in Datomic in a specially designed index, designed for efficient queries and optimal data locality. It also includes a Ring server for Riemann, so that it can serve the Giraffe dashboard from the port of your choosing, and configure it in your Riemann configuration files.
 
 To use it, you must run Riemann without the helper process. For instance, you could use
 
@@ -16,7 +16,7 @@ You should add this as a dependency of Riemann, then use `riemann-enhancements.c
 
 The resampler's settings should be exposed through the Graphite API.
 
-Implement enough of Graphite's API to support (graphitus)[https://github.com/erezmazor/graphitus].
+Implement enough of Graphite's API to support [graphitus](https://github.com/erezmazor/graphitus).
 
 The current version only can handle up to a million metrics due to Datomic design decisions. By implementing DB sharding, we could scale to many million of metrics and improve write parallelism. This *does not* affect the number of metric events storable.
 
