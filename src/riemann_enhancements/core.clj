@@ -282,7 +282,11 @@
   "Takes the uri of the datomic db that will be used to store the metrics. This should be the only
    thing going into that db (remember that transactors have an unlimited number of dbs)."
   [& {:keys [uri flush-rate] :or {flush-rate 10000}}]
+  ;; TODO: have agent resend data when a transaction fails
   (let [metrics-agent (agent {:metrics {}})]
+    (set-error-mode! metrics-agent :continue)
+    (set-error-handler! metrics-agent (fn [a e]
+                                        (log/error e "Metrics agent encountered an exception")))
     ;; Asynchronously connect to and initialize datomic
     (send-off metrics-agent
               (fn [metrics]
